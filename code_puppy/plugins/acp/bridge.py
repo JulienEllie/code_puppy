@@ -76,10 +76,12 @@ _PATH_ARG_KEYS = ("file_path", "path", "target_file", "filename")
 _MAX_DIFF_CHARS = 8000
 
 # Interactive TUI tools that can't run headless over ACP (they'd render a
-# terminal picker + read stdin, which is the JSON-RPC pipe). Until ACP ratifies
-# structured elicitation (currently an RFD), we block these and steer the model
-# to ask the user in plain text instead — which the client shows as a normal
-# assistant message. See README → *Interactive tools*.
+# terminal picker + read stdin, which is the JSON-RPC pipe). When the client
+# supports ACP **form elicitation** (0.11+, e.g. the latest Zed) we forward the
+# question to the client and feed the answer straight back (see
+# ``elicitation.py``). Otherwise we block and steer the model to ask in plain
+# text — which the client shows as a normal assistant message. See README
+# → *Interactive tools*.
 _INTERACTIVE_TOOLS = {"ask_user_question"}
 _INTERACTIVE_BLOCK = {
     "blocked": True,
@@ -182,6 +184,20 @@ class EventBridge:
         if session_id is None:
             return None
         if tool_name in _INTERACTIVE_TOOLS:
+            # Prefer a native client elicitation; fall back to the block when
+            # the client can't render one. Returning {"result": ...} short-
+            # circuits the real (headless-incapable) tool with the answer.
+            from code_puppy.plugins.acp import elicitation
+
+            questions = (
+                tool_args.get("questions") if isinstance(tool_args, dict) else None
+            )
+            try:
+                output = await elicitation.ask(questions)
+            except Exception:  # noqa: BLE001
+                output = None
+            if output is not None:
+                return {"result": output}
             return dict(_INTERACTIVE_BLOCK)
         tool_call_id = state.push_tool_call(tool_name)
         update = start_tool_call(

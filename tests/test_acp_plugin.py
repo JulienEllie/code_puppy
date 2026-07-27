@@ -1390,11 +1390,12 @@ def test_mode_state_lists_agents():
 
 @pytest.mark.asyncio
 async def test_interactive_tool_blocked_over_acp():
-    """ask_user_question can't run headless; the bridge blocks it (steering the
+    """Without client elicitation, ask_user_question is blocked (steering the
     model to ask in plain text) without opening a dangling tool-call entry.
     """
     conn = FakeConnection()
     state.set_connection(conn, asyncio.get_event_loop())
+    state.set_client_capabilities(None)
     state.begin_run("s1")
     bridge = bridge_mod.EventBridge()
     try:
@@ -1407,6 +1408,76 @@ async def test_interactive_tool_blocked_over_acp():
     finally:
         state.end_run()
         state.set_connection(None, None)
+
+
+@pytest.mark.asyncio
+async def test_interactive_tool_forwarded_as_elicitation():
+    """With a client that supports form elicitation, ask_user_question is
+    forwarded to the client and the answer is fed back as the tool result.
+    """
+    from acp.schema import (
+        AcceptElicitationResponse,
+        ElicitationCapabilities,
+        ElicitationFormCapabilities,
+    )
+
+    class ElicitConnection(FakeConnection):
+        def __init__(self):
+            super().__init__()
+            self.elicitations = []
+
+        async def create_elicitation(self, message, mode):
+            self.elicitations.append((message, mode))
+            return AcceptElicitationResponse(
+                action="accept",
+                content={"Scope": "Both", "Langs": ["py", "rs"]},
+            )
+
+    conn = ElicitConnection()
+    state.set_connection(conn, asyncio.get_event_loop())
+    state.set_client_capabilities(
+        ClientCapabilities(
+            elicitation=ElicitationCapabilities(form=ElicitationFormCapabilities())
+        )
+    )
+    state.begin_run("s1")
+    bridge = bridge_mod.EventBridge()
+    try:
+        args = {
+            "questions": [
+                {
+                    "header": "Scope",
+                    "question": "What scope?",
+                    "options": [{"label": "A"}, {"label": "Both"}],
+                },
+                {
+                    "header": "Langs",
+                    "question": "Which langs?",
+                    "multi_select": True,
+                    "options": [{"label": "py"}, {"label": "rs"}],
+                },
+            ]
+        }
+        result = await bridge._on_pre_tool_call("ask_user_question", args)
+        # A substituted result (not a block) carrying the mapped answers.
+        assert isinstance(result, dict) and "result" in result
+        assert result["result"]["cancelled"] is False
+        answers = {
+            a["question_header"]: a["selected_options"]
+            for a in result["result"]["answers"]
+        }
+        assert answers == {"Scope": ["Both"], "Langs": ["py", "rs"]}
+        # The client actually got a form elicitation for this session.
+        assert len(conn.elicitations) == 1
+        _, mode = conn.elicitations[0]
+        assert mode.session_id == "s1"
+        assert set(mode.requested_schema.properties) == {"Scope", "Langs"}
+        # No dangling tool-call entry was opened.
+        assert state.current_tool_call() is None
+    finally:
+        state.end_run()
+        state.set_connection(None, None)
+        state.set_client_capabilities(None)
 
 
 # --------------------------------------------------------------------------- #

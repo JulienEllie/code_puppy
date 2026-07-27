@@ -111,6 +111,7 @@ class CodePuppyAgent(Agent):
         connection leaves the global callback registry clean.
         """
         self._bridge.unregister()
+        state.set_client_capabilities(None)
 
     # ---- Handshake --------------------------------------------------------
     async def initialize(
@@ -128,6 +129,7 @@ class CodePuppyAgent(Agent):
         the client advertises). Everything else stays local.
         """
         self._client_caps = client_capabilities
+        state.set_client_capabilities(client_capabilities)
         io_delegation.install(client_capabilities)
         return InitializeResponse(
             protocol_version=PROTOCOL_VERSION,

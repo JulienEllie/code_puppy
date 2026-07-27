@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 _CONNECTION: Any = None
 _LOOP: Optional[asyncio.AbstractEventLoop] = None
+_CLIENT_CAPS: Any = None
 
 # Per-run state, isolated per prompt task via a ContextVar. ``None`` means "no
 # run active in this context". The value is a mutable dict:
@@ -63,6 +64,34 @@ def get_connection() -> Any:
 def get_loop() -> Optional[asyncio.AbstractEventLoop]:
     """Return the ACP event loop, or ``None`` when not in ACP mode."""
     return _LOOP
+
+
+def set_client_capabilities(caps: Any) -> None:
+    """Record the client's negotiated ``ClientCapabilities`` (or ``None``).
+
+    Set once at ``initialize`` so edges that decide whether to delegate to the
+    client -- e.g. forwarding ``ask_user_question`` as a native elicitation --
+    can consult what the client actually supports without threading the caps
+    through every call site.
+    """
+    global _CLIENT_CAPS
+    _CLIENT_CAPS = caps
+
+
+def client_supports_form_elicitation() -> bool:
+    """Whether the client advertised ``elicitation.form`` support.
+
+    Defensive: a missing caps blob, a client that omits ``elicitation``, or one
+    that offers only ``url`` elicitation all degrade to ``False`` (run/​block
+    locally), never to a crash.
+    """
+    caps = _CLIENT_CAPS
+    if caps is None:
+        return False
+    elicitation = getattr(caps, "elicitation", None)
+    if elicitation is None:
+        return False
+    return getattr(elicitation, "form", None) is not None
 
 
 # ---- Per-run context ------------------------------------------------------

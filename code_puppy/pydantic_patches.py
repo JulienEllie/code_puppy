@@ -391,6 +391,20 @@ def patch_tool_call_callbacks() -> None:
                         block_msg = f"🚫 Hook blocked this tool call: {clean_reason}"
                         emit_warning(block_msg)
                         return f"ERROR: {block_msg}\n\nThe hook policy prevented this tool from running. Please inform the user and do not retry this specific command."
+
+                # --- result substitution ---
+                # A hook may return {"result": <value>} (not blocked) to supply
+                # the tool's result itself, short-circuiting the real tool. Used
+                # by the ACP plugin to forward ``ask_user_question`` to the
+                # client as a native elicitation and feed the answer straight
+                # back. First hook to substitute wins.
+                for callback_result in callback_results:
+                    if (
+                        isinstance(callback_result, dict)
+                        and not callback_result.get("blocked")
+                        and "result" in callback_result
+                    ):
+                        return callback_result["result"]
             except Exception:
                 pass  # other errors don't block tool execution
 

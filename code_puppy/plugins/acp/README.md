@@ -27,8 +27,7 @@ restarts), `session/set_mode`, `session/set_config_option`. Assistant text +
 > for file writes and shell commands are surfaced in the client's own allow/deny
 > dialog in non-yolo mode.
 >
-> Not implemented: `elicitation/*` (the SDK's connection API exposes no
-> elicitation call in 0.10.1), `plan` updates (Code Puppy has no plan model),
+> Not implemented: `plan` updates (Code Puppy has no plan model)
 > and the unstable `document/*` / `nes/*` / `providers/*` surface.
 
 ---
@@ -127,7 +126,8 @@ Every file stays well under the 600-line cap and owns one concern.
 | `mcp_config.py` | Translate client-injected ACP MCP server specs → pydantic-ai servers on the session agent. |
 | `session_config.py` | Build the model picker + agent-backed **mode** picker + safe config options (all `category`-tagged selects); apply `set_config_option`. |
 | `session_modes.py` | Map Code Puppy's **agent catalogue** to ACP session modes (a mode *is* an agent); build the canonical `SessionModeState` and feed the `category="mode"` config option from one source. |
-| `bridge.py` | `EventBridge`: registers `stream_event` / `pre_tool_call` / `post_tool_call` hooks and translates them into SDK `session/update`s via `connection.session_update`. (Hooks, **not** MessageBus — see *Event source*.) |
+| `bridge.py` | `EventBridge`: registers `stream_event` / `pre_tool_call` / `post_tool_call` hooks and translates them into SDK `session/update`s via `connection.session_update`. Also forwards `ask_user_question` to client elicitation (or blocks it). (Hooks, **not** MessageBus — see *Event source*.) |
+| `elicitation.py` | Map `ask_user_question` ↔ native ACP **form elicitation** (`connection.create_elicitation`): build the request schema from the questions, map the client's answer back to `AskUserQuestionOutput`. Best-effort; falls back to the block when unsupported. |
 | `permissions.py` | Wires Code Puppy's two approval edges to the client via the SDK's `request_permission`: the `tools.common` approval backend (files, cross-thread) and the `run_shell_command` hook (shell). Fails closed. |
 | `io_delegation.py` | `DelegatedFileSystemBackend` (sync, cross-thread) + `DelegatedCommandExecutor` (async terminal lifecycle) that plug into the core I/O seams, capability-gated. |
 | `state.py` | Process-wide run context: the SDK connection + its loop, the active session id, and the open-tool-call stack — so the permission/I/O seams (plain module functions) can reach the running connection and correlate events. |
@@ -198,8 +198,7 @@ double-send.
 | `session/set_mode` | Switch the session's **mode**, rebinding it to a different Code Puppy **agent** (history + client MCP servers preserved). A mode *is* an agent (see `session_modes.py`); we publish the agent catalogue as both a `SessionModeState` and a `category="mode"` config option, and push a `current_mode_update` on change. |
 | `session/set_config_option` | Apply a config change: `model` (rebinds the session's model), `mode` (rebinds the session's agent — the config-option path the latest Zed renders in preference to `SessionModeState`), or the streaming toggle; never yolo. |
 
-Not implemented: `elicitation/*` (the SDK connection exposes no elicitation
-call in 0.10.1), `plan` updates (no native plan model), and the unstable
+Not implemented: `plan` updates (no native plan model) and the unstable
 `document/*` / `nes/*` / `providers/*` surface. The SDK router resolves any
 unimplemented method to a clean "method not found", so we advertise honestly
 and stub nothing.
@@ -236,14 +235,22 @@ neither is available over ACP (stdin *is* the JSON-RPC pipe). The tool's own
 `isatty()` guard already makes it fail closed there (no stdout corruption), but
 the default "not an interactive terminal" error is a dead end.
 
-So in ACP mode the `EventBridge` **blocks** `ask_user_question` at the
-`pre_tool_call` seam (before any tool-call entry is opened) and returns guidance
-steering the model to *ask the user directly in its normal text response* — which
-the client renders as a regular assistant message the user can reply to. This is
-the pragmatic stand-in until ACP ratifies structured **elicitation** (currently
-only an [RFD](https://agentclientprotocol.com), not in stable v1 — no client,
-including Zed, implements it yet). When elicitation lands and the SDK exposes a
-connection method for it, this block becomes a real native picker.
+So in ACP mode the `EventBridge` intercepts `ask_user_question` at the
+`pre_tool_call` seam (before any tool-call entry is opened):
+
+* **Client supports form elicitation** (ACP 0.11+; Zed enabled it by default in
+  v1.12.0 — PR #60749 — by advertising `elicitation.form`) → the question is
+  forwarded to the client via
+  `connection.create_elicitation(...)` as a native form (single-select → a
+  string `one_of`; multi-select → an `array` of enum items; see
+  `elicitation.py`). The user's choices map straight back to the tool's
+  `AskUserQuestionOutput`, fed to the model as the tool result via the
+  `pre_tool_call` **result-substitution** contract (`{"result": ...}`). A
+  decline/cancel returns a real `cancelled` answer.
+* **Client can't render one** → we fall back to **blocking** the tool and
+  returning guidance that steers the model to *ask the user directly in its
+  normal text response* — which the client renders as a regular assistant
+  message the user can reply to.
 
 ---
 
