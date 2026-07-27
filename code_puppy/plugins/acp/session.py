@@ -54,9 +54,16 @@ class ACPSession:
         cwd: Optional[str] = None,
         additional_directories: Optional[List[str]] = None,
         mcp_specs: Optional[List[Any]] = None,
+        agent_name: Optional[str] = None,
     ) -> None:
         self.session_id = session_id
         self.agent = agent
+        # The name of the Code Puppy agent this session is bound to -- i.e. its
+        # ACP *session mode* (a mode is an agent; see ``session_modes``). Tracked
+        # per-session, not globally, so two client threads can run different
+        # agents at once and a ``session/set_mode`` on one never disturbs
+        # another. Rebinds (mode switch or model change) keep this in step.
+        self.agent_name = agent_name
         self.cwd = cwd
         self.additional_directories = list(additional_directories or [])
         # Raw client-injected ACP MCP specs, retained so they can be re-attached

@@ -125,6 +125,24 @@ def _update_types(conn: FakeConnection) -> List[str]:
     return [getattr(u, "session_update", None) for _, u in conn.updates]
 
 
+@pytest.fixture(autouse=True)
+def _stub_agent_catalogue(monkeypatch):
+    """Deterministic agent catalogue so mode enumeration is fast + stable.
+
+    A Code Puppy *mode* is an *agent* (see ``session_modes``), so every session
+    response and the ``category="mode"`` config option are built from these two
+    functions. Stubbing them keeps the tests off real on-disk agent discovery.
+    """
+    monkeypatch.setattr(
+        "code_puppy.agents.agent_manager.get_available_agents",
+        lambda: {"code-puppy": "Code Puppy", "reviewer": "Reviewer"},
+    )
+    monkeypatch.setattr(
+        "code_puppy.agents.agent_manager.get_agent_descriptions",
+        lambda: {"code-puppy": "Default agent", "reviewer": "Reviews code"},
+    )
+
+
 @pytest_asyncio.fixture
 async def wired_agent(monkeypatch):
     """A ``CodePuppyAgent`` connected to a fake connection, with cleanup.
@@ -1271,16 +1289,71 @@ async def test_set_config_model_rebinds_model(wired_agent, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_set_session_mode_is_noop(wired_agent, monkeypatch):
-    """session/set_mode never switches models (Code Puppy has no modes)."""
-    agent, _ = wired_agent
-    called = {}
-    monkeypatch.setattr(
-        "code_puppy.config.set_model_name", lambda m: called.__setitem__("m", m)
-    )
+async def test_set_session_mode_switches_agent(wired_agent, monkeypatch):
+    """session/set_mode rebinds the session to the named agent, keeping state."""
+    agent, conn = wired_agent
+    loaded = {}
+
+    def fake_load(name):
+        loaded["name"] = name
+        return FakeAgent(stream=True)
+
+    monkeypatch.setattr("code_puppy.agents.agent_manager.load_agent", fake_load)
     new = await agent.new_session(cwd="/tmp")
-    await agent.set_session_mode("anything", new.session_id)
-    assert called == {}
+    assert agent._sessions[new.session_id].agent_name == "code-puppy"
+    agent._sessions[new.session_id].agent.set_message_history(["keep-me"])
+    await agent.set_session_mode("reviewer", new.session_id)
+    # The session rebound to the requested agent, history preserved.
+    assert loaded["name"] == "reviewer"
+    assert agent._sessions[new.session_id].agent_name == "reviewer"
+    assert agent._sessions[new.session_id].agent.get_message_history() == ["keep-me"]
+    # The client is told about the new mode.
+    assert "current_mode_update" in _update_types(conn)
+    # An unknown mode is a safe no-op (no rebind).
+    loaded.clear()
+    await agent.set_session_mode("does-not-exist", new.session_id)
+    assert loaded == {}
+
+
+@pytest.mark.asyncio
+async def test_new_session_advertises_agent_modes(wired_agent):
+    """new_session publishes a SessionModeState, one mode per agent."""
+    agent, _ = wired_agent
+    new = await agent.new_session(cwd="/tmp")
+    assert new.modes is not None
+    assert {m.id for m in new.modes.available_modes} == {"code-puppy", "reviewer"}
+    assert new.modes.current_mode_id == "code-puppy"
+
+
+@pytest.mark.asyncio
+async def test_set_config_mode_switches_agent(wired_agent, monkeypatch):
+    """The category='mode' config option rebinds the session's agent too."""
+    agent, _ = wired_agent
+    names: List[str] = []
+
+    def fake_load(name):
+        names.append(name)
+        return FakeAgent(stream=True)
+
+    monkeypatch.setattr("code_puppy.agents.agent_manager.load_agent", fake_load)
+    new = await agent.new_session(cwd="/tmp")
+    resp = await agent.set_config_option("mode", new.session_id, "reviewer")
+    assert agent._sessions[new.session_id].agent_name == "reviewer"
+    mode_opt = next(o for o in resp.config_options if o.id == "mode")
+    assert mode_opt.current_value == "reviewer"
+    assert names[-1] == "reviewer"
+
+
+def test_mode_option_lists_agents():
+    """The mode picker is a category='mode' select, one entry per agent."""
+    from code_puppy.plugins.acp import session_config
+
+    opts = session_config.config_options("reviewer")
+    mode_opt = next(o for o in opts if o.id == "mode")
+    assert mode_opt.category == "mode"
+    assert mode_opt.type == "select"
+    assert {o.value for o in mode_opt.options} == {"code-puppy", "reviewer"}
+    assert mode_opt.current_value == "reviewer"
 
 
 def test_config_options_expose_model_select(monkeypatch):
@@ -1304,16 +1377,15 @@ def test_config_options_expose_model_select(monkeypatch):
     assert next(o for o in opts2 if o.id == "model").current_value == "alpha"
 
 
-def test_mode_state_is_single_default():
-    """We advertise one 'default' mode as a category=mode select (not blank)."""
+def test_mode_state_lists_agents():
+    """We advertise one mode per agent as a category=mode select."""
     from code_puppy.plugins.acp import session_config
 
     opts = session_config.config_options()
     mode_opt = next(o for o in opts if o.id == "mode")
     assert mode_opt.category == "mode"
     assert mode_opt.type == "select"
-    assert mode_opt.current_value == "default"
-    assert [o.value for o in mode_opt.options] == ["default"]
+    assert {o.value for o in mode_opt.options} == {"code-puppy", "reviewer"}
 
 
 @pytest.mark.asyncio

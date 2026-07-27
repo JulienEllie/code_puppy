@@ -8,12 +8,13 @@ option by its ``category``, so this is the shape that actually populates them:
   ``{id: "model", category: "model", type: "select", ...}``. Backed by
   ``model_picker_completion.load_model_names`` + ``config.get_global_model_name``
   / ``set_model_name``. Changing it rebinds the live session's model.
-* **Mode picker** — a ``select`` option tagged ``category="mode"``. Code Puppy
-  has exactly one operating mode, so this is a single "Default" entry; we still
-  send it so the client's mode dropdown reads "Default" instead of an empty
-  "Unknown" control. (ACP's top-level ``SessionModeState`` is a *different*
-  mechanism that Zed 1.7.2 does not bind that dropdown to -- config options are
-  what work across clients.)
+* **Mode picker** — a ``select`` option tagged ``category="mode"``, one entry
+  per available Code Puppy **agent** (a mode *is* an agent; see
+  ``session_modes``). Selecting one rebinds the live session to that agent.
+  The latest Zed binds its mode dropdown to config options in preference to the
+  top-level ``SessionModeState`` ("Config options take precedence over legacy
+  mode/model selectors"), so this select is what actually renders there; the
+  canonical ``SessionModeState`` is published in parallel for pure-ACP clients.
 * **Streaming toggle** — an On/Off ``select`` option. (A boolean option would
   be more natural, but Zed 1.7.2 renders only ``select`` options in its bottom
   bar -- a boolean shows as "Unknown" -- so every control here is a select.) We
@@ -43,31 +44,34 @@ _STREAMING_ID = "enable_streaming"
 _STREAMING_ON = "on"
 _STREAMING_OFF = "off"
 
-# Code Puppy has exactly one operating mode. We still advertise it as a
-# category="mode" select so the client's mode dropdown shows "Default" rather
-# than an empty "Unknown" control. (Model selection is the separate
-# category="model" option; ACP clients bind each dropdown to its category.)
-_DEFAULT_MODE_ID = "default"
 
+def _mode_option(
+    current_mode_id: Optional[str] = None,
+) -> Optional[SessionConfigOptionSelect]:
+    """Build the agent picker as a ``category="mode"`` select option.
 
-def _mode_option() -> SessionConfigOptionSelect:
-    """Advertise Code Puppy's single "Default" mode as a category=mode select.
-
-    There is nothing to switch between, but a one-item option keeps the
-    client's mode dropdown meaningful instead of blank.
+    One entry per available agent (see ``session_modes``); ``current_mode_id``
+    is the session's currently-bound agent, coerced into the offered set.
+    Returns ``None`` when no agents can be enumerated, so a discovery hiccup
+    simply omits the control instead of showing a blank dropdown.
     """
+    from code_puppy.plugins.acp import session_modes
+
+    modes = session_modes.available_modes()
+    if not modes:
+        return None
+    current = session_modes.resolve_current(current_mode_id) or modes[0][0]
     return SessionConfigOptionSelect(
         id=MODE_OPTION_ID,
         name="Mode",
         category="mode",
         type="select",
-        current_value=_DEFAULT_MODE_ID,
+        current_value=current,
         options=[
             SessionConfigSelectOption(
-                value=_DEFAULT_MODE_ID,
-                name="Default",
-                description="Standard Code Puppy session",
+                value=mode_id, name=name, description=description or None
             )
+            for mode_id, name, description in modes
         ],
     )
 
@@ -118,11 +122,13 @@ def set_model(model_id: str) -> bool:
         return False
 
 
-def config_options() -> List[Any]:
-    """Build the config-option list for a session (model picker + streaming).
+def config_options(current_mode_id: Optional[str] = None) -> List[Any]:
+    """Build the config-option list for a session (model + mode + streaming).
 
-    Order matters for presentation: the model picker leads. Either entry is
-    omitted if it can't be built, so a config hiccup never sinks the session.
+    Order matters for presentation: the model picker leads, then the agent
+    (mode) picker. ``current_mode_id`` is the session's currently-bound agent
+    so the mode dropdown reflects reality. Any entry is omitted if it can't be
+    built, so a config hiccup never sinks the session.
     """
     opts: List[Any] = []
     try:
@@ -132,7 +138,9 @@ def config_options() -> List[Any]:
     except Exception:  # noqa: BLE001
         logger.debug("ACP: could not build model option", exc_info=True)
     try:
-        opts.append(_mode_option())
+        mode_opt = _mode_option(current_mode_id)
+        if mode_opt is not None:
+            opts.append(mode_opt)
     except Exception:  # noqa: BLE001
         logger.debug("ACP: could not build mode option", exc_info=True)
     try:

@@ -29,6 +29,7 @@ from acp.schema import (
     AvailableCommandsUpdate,
     ClientCapabilities,
     CloseSessionResponse,
+    CurrentModeUpdate,
     Implementation,
     InitializeResponse,
     ListSessionsResponse,
@@ -47,6 +48,7 @@ from code_puppy.plugins.acp import (
     persistence,
     replay,
     session_config,
+    session_modes,
     state,
 )
 from code_puppy.plugins.acp.bridge import EventBridge
@@ -69,6 +71,16 @@ def _code_puppy_version() -> str:
         return version("code-puppy")
     except PackageNotFoundError:
         return "0.0.0"
+
+
+def _current_agent_name() -> str:
+    """The globally-selected agent name, or a safe default on error."""
+    try:
+        from code_puppy.agents.agent_manager import get_current_agent_name
+
+        return get_current_agent_name()
+    except Exception:  # noqa: BLE001
+        return "code-puppy"
 
 
 class CodePuppyAgent(Agent):
@@ -147,11 +159,14 @@ class CodePuppyAgent(Agent):
         the client injects are attached to the agent.
         """
         session_id = f"sess_{uuid.uuid4().hex[:16]}"
-        self._make_session(session_id, cwd, additional_directories, mcp_servers)
+        session = self._make_session(
+            session_id, cwd, additional_directories, mcp_servers
+        )
         self._announce_commands_soon(session_id)
         return NewSessionResponse(
             session_id=session_id,
-            config_options=session_config.config_options() or None,
+            modes=session_modes.mode_state(session.agent_name),
+            config_options=session_config.config_options(session.agent_name) or None,
         )
 
     async def load_session(
@@ -177,7 +192,8 @@ class CodePuppyAgent(Agent):
         await replay.replay_history(session_id, session.agent.get_message_history())
         self._announce_commands_soon(session_id)
         return LoadSessionResponse(
-            config_options=session_config.config_options() or None,
+            modes=session_modes.mode_state(session.agent_name),
+            config_options=session_config.config_options(session.agent_name) or None,
         )
 
     async def resume_session(
@@ -197,7 +213,8 @@ class CodePuppyAgent(Agent):
         await replay.replay_history(session_id, session.agent.get_message_history())
         self._announce_commands_soon(session_id)
         return ResumeSessionResponse(
-            config_options=session_config.config_options() or None,
+            modes=session_modes.mode_state(session.agent_name),
+            config_options=session_config.config_options(session.agent_name) or None,
         )
 
     async def fork_session(
@@ -222,11 +239,13 @@ class CodePuppyAgent(Agent):
         if source is not None:
             source_history = list(source.agent.get_message_history())
             source_cwd = source.cwd
+            source_mode = source.agent_name
         else:
             source_history = persistence.load_history(session_id)
             if source_history is None:
                 raise ValueError(f"unknown session to fork: {session_id}")
             source_cwd = None
+            source_mode = None
         new_id = f"sess_{uuid.uuid4().hex[:16]}"
         session = self._make_session(
             new_id,
@@ -238,59 +257,113 @@ class CodePuppyAgent(Agent):
             session.agent.set_message_history(source_history)
         except Exception:  # noqa: BLE001
             logger.debug("ACP: fork history copy failed", exc_info=True)
+        # Preserve the source's mode (agent) so a fork continues in the same
+        # agent it branched from, not whatever the global default happens to be.
+        if source_mode and source_mode != session.agent_name:
+            self._rebind_session_agent(new_id, agent_name=source_mode)
         self._announce_commands_soon(new_id)
         return ForkSessionResponse(
             session_id=new_id,
-            config_options=session_config.config_options() or None,
+            modes=session_modes.mode_state(session.agent_name),
+            config_options=session_config.config_options(session.agent_name) or None,
         )
 
     async def set_session_mode(
         self, mode_id: str, session_id: str, **kwargs: Any
     ) -> SetSessionModeResponse:
-        """No-op mode handler.
+        """Switch a session's mode by rebinding it to the named agent.
 
-        Code Puppy has no ACP *session modes* (e.g. plan vs default); model
-        selection is exposed as a ``model`` config option instead (that is what
-        clients bind their model picker to -- see ``session_config``). This
-        method exists only to satisfy the SDK router's ``session/set_mode``
-        route; any mode id is accepted as a no-op.
+        A Code Puppy *mode* is an *agent* (see ``session_modes``), so
+        ``session/set_mode`` rebinds the live session to ``mode_id``'s agent,
+        preserving its message history and client-injected MCP servers so the
+        switch is invisible to the running conversation. An unknown mode id or a
+        no-change request is a safe no-op. On a real change we push a
+        ``current_mode_update`` and re-announce commands (a different agent may
+        expose different slash commands).
         """
+        session = self._sessions.get(session_id)
+        if session is None or not session_modes.is_known_mode(mode_id):
+            return SetSessionModeResponse()
+        if mode_id == session.agent_name:
+            return SetSessionModeResponse()
+        self._rebind_session_agent(session_id, agent_name=mode_id)
+        await self._announce_mode(session_id, session.agent_name or mode_id)
+        self._announce_commands_soon(session_id)
         return SetSessionModeResponse()
 
-    def _rebind_session_model(self, session_id: str) -> None:
-        """Rebuild a live session's agent on the current model, keeping state.
+    def _rebind_session_agent(
+        self, session_id: str, agent_name: Optional[str] = None
+    ) -> None:
+        """Rebuild a live session's agent, keeping its state.
 
-        Message history and any client-injected MCP servers are preserved, so
-        the switch is invisible to the conversation. Best-effort: a rebind
-        failure leaves the existing agent in place.
+        Used for both a mode switch (``agent_name`` given -> bind that agent)
+        and a model change (``agent_name`` omitted -> rebuild the session's
+        *current* agent on the freshly-selected model). Message history and any
+        client-injected MCP servers are preserved, so the switch is invisible to
+        the conversation. Best-effort: a rebind failure leaves the existing
+        agent in place.
         """
         session = self._sessions.get(session_id)
         if session is None:
             return
         try:
             history = list(session.agent.get_message_history())
-            session.agent = self._new_agent()
+            name = agent_name or session.agent_name
+            session.agent = self._new_agent(name)
+            session.agent_name = name
             session.agent.set_message_history(history)
             if session.mcp_specs:
                 mcp_config.attach(session.agent, session.mcp_specs)
         except Exception:  # noqa: BLE001
-            logger.debug("ACP: model rebind failed", exc_info=True)
+            logger.debug("ACP: agent rebind failed", exc_info=True)
+
+    async def _announce_mode(self, session_id: str, mode_id: str) -> None:
+        """Push a ``current_mode_update`` so the client reflects the new mode."""
+        connection = state.get_connection()
+        if connection is None:
+            return
+        try:
+            await connection.session_update(
+                session_id,
+                CurrentModeUpdate(
+                    session_update="current_mode_update", current_mode_id=mode_id
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("ACP: current_mode_update failed", exc_info=True)
 
     async def set_config_option(
         self, config_id: str, session_id: str, value: Any, **kwargs: Any
     ) -> Any:
         """Apply a config-option change and return the refreshed options.
 
-        A change to the ``model`` option rebinds the live session's agent to the
-        newly-selected model (history + client MCP servers preserved), so the
-        client's model picker switches the model mid-thread.
+        * ``model`` rebinds the live session's agent to the newly-selected model
+          (history + client MCP servers preserved), so the client's model picker
+          switches the model mid-thread.
+        * ``mode`` rebinds the session to a different agent (see
+          ``set_session_mode``) -- the same behaviour, reached via the config
+          option the latest Zed renders in preference to ``SessionModeState``.
         """
         from acp.schema import SetSessionConfigOptionResponse
 
-        options = session_config.apply_config_option(config_id, value)
-        if config_id == session_config.MODEL_OPTION_ID:
-            self._rebind_session_model(session_id)
-        return SetSessionConfigOptionResponse(config_options=options or None)
+        if config_id == session_config.MODE_OPTION_ID:
+            session = self._sessions.get(session_id)
+            if (
+                session is not None
+                and session_modes.is_known_mode(str(value))
+                and str(value) != session.agent_name
+            ):
+                self._rebind_session_agent(session_id, agent_name=str(value))
+                self._announce_commands_soon(session_id)
+        else:
+            session_config.apply_config_option(config_id, value)
+            if config_id == session_config.MODEL_OPTION_ID:
+                self._rebind_session_agent(session_id)
+        session = self._sessions.get(session_id)
+        current_mode = session.agent_name if session is not None else None
+        return SetSessionConfigOptionResponse(
+            config_options=session_config.config_options(current_mode) or None
+        )
 
     async def list_sessions(
         self, cursor: Optional[str] = None, cwd: Optional[str] = None, **kwargs: Any
@@ -384,6 +457,7 @@ class CodePuppyAgent(Agent):
         Client-injected ``mcp_servers`` are attached best-effort.
         """
         agent = self._new_agent()
+        agent_name = getattr(agent, "name", None) or _current_agent_name()
         if rehydrate:
             history = persistence.load_history(session_id)
             if history:
@@ -399,15 +473,16 @@ class CodePuppyAgent(Agent):
             cwd=cwd,
             additional_directories=additional_directories,
             mcp_specs=mcp_servers,
+            agent_name=agent_name,
         )
         self._sessions[session_id] = session
         return session
 
     @staticmethod
-    def _new_agent() -> Any:
-        from code_puppy.agents.agent_manager import get_current_agent_name, load_agent
+    def _new_agent(agent_name: Optional[str] = None) -> Any:
+        from code_puppy.agents.agent_manager import load_agent
 
-        return load_agent(get_current_agent_name())
+        return load_agent(agent_name or _current_agent_name())
 
     def _announce_commands_soon(self, session_id: str) -> None:
         """Schedule an ``available_commands_update`` after the response ships.

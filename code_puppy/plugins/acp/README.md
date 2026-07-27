@@ -125,7 +125,8 @@ Every file stays well under the 600-line cap and owns one concern.
 | `persistence.py` | Pickle each session's history under `AUTOSAVE_DIR/acp` keyed by session id, plus an ACP metadata sidecar (`cwd` + `additionalDirectories` + title). Rehydrate on `load`/`resume`/`fork`; enumerate for `session/list` (`list_persisted`); tombstone on `session/close` (`delete`). |
 | `replay.py` | On `load`/`resume`, stream the rehydrated history back to the client as ordered `session/update`s (user / agent text / thinking / past tool calls) so the client rebuilds the thread UI. |
 | `mcp_config.py` | Translate client-injected ACP MCP server specs → pydantic-ai servers on the session agent. |
-| `session_config.py` | Build the model list (surfaced as ACP *modes*) + safe config options; apply `set_mode` / `set_config_option`. |
+| `session_config.py` | Build the model picker + agent-backed **mode** picker + safe config options (all `category`-tagged selects); apply `set_config_option`. |
+| `session_modes.py` | Map Code Puppy's **agent catalogue** to ACP session modes (a mode *is* an agent); build the canonical `SessionModeState` and feed the `category="mode"` config option from one source. |
 | `bridge.py` | `EventBridge`: registers `stream_event` / `pre_tool_call` / `post_tool_call` hooks and translates them into SDK `session/update`s via `connection.session_update`. (Hooks, **not** MessageBus — see *Event source*.) |
 | `permissions.py` | Wires Code Puppy's two approval edges to the client via the SDK's `request_permission`: the `tools.common` approval backend (files, cross-thread) and the `run_shell_command` hook (shell). Fails closed. |
 | `io_delegation.py` | `DelegatedFileSystemBackend` (sync, cross-thread) + `DelegatedCommandExecutor` (async terminal lifecycle) that plug into the core I/O seams, capability-gated. |
@@ -194,9 +195,8 @@ double-send.
 | `session/prompt` | Parse content blocks (text + image attachments) or execute a `/slash` command; run the agent as a cancellable task; stream updates; return stop reason **+ token usage**. |
 | `session/cancel` | Cancel the in-flight run's task **and kill local shells** → `cancelled`. |
 | `session/list` / `session/close` | List sessions (**live in-memory + persisted on disk**, deduped, so threads survive a restart and stay revivable) / drop a session (also deletes its persisted copy). |
-| `session/set_mode` | Switch the active model, rebinding the session agent (history preserved). Code Puppy surfaces its model list as ACP *modes* (0.11 removed the separate models API). |
-| `session/set_config_option` | Apply a safe config change (streaming toggle); never yolo. |
-| `session/set_mode` | No-op (Code Puppy has one mode). |
+| `session/set_mode` | Switch the session's **mode**, rebinding it to a different Code Puppy **agent** (history + client MCP servers preserved). A mode *is* an agent (see `session_modes.py`); we publish the agent catalogue as both a `SessionModeState` and a `category="mode"` config option, and push a `current_mode_update` on change. |
+| `session/set_config_option` | Apply a config change: `model` (rebinds the session's model), `mode` (rebinds the session's agent — the config-option path the latest Zed renders in preference to `SessionModeState`), or the streaming toggle; never yolo. |
 
 Not implemented: `elicitation/*` (the SDK connection exposes no elicitation
 call in 0.10.1), `plan` updates (no native plan model), and the unstable
